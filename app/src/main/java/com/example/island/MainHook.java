@@ -3,6 +3,7 @@ package com.example.island;
 import android.animation.TimeInterpolator;
 import android.animation.ValueAnimator;
 import android.app.Application;
+import android.content.ComponentCallbacks;
 import android.content.Context;
 import android.content.res.Configuration;
 import android.graphics.Color;
@@ -34,6 +35,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final int EXPANDED_H_DP = 92;
     private static final long ANIM_MS = 550;
 
+    // Window layer above the status bar so the island receives taps
+    private static final int WINDOW_TYPE = 2024; // TYPE_NAVIGATION_BAR_PANEL
+
     private static boolean added = false;
 
     @Override
@@ -49,9 +53,8 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-    private static boolean isLandscape(Context ctx) {
-        return ctx.getResources().getConfiguration().orientation
-                == Configuration.ORIENTATION_LANDSCAPE;
+    private static boolean isLandscape(Configuration c) {
+        return c.orientation == Configuration.ORIENTATION_LANDSCAPE;
     }
 
     private static void addIsland(Context ctx) {
@@ -77,15 +80,7 @@ public class MainHook implements IXposedHookLoadPackage {
             label.setGravity(Gravity.CENTER);
             label.setAlpha(0f);
 
-            // Hides itself in landscape, shows again in portrait
-            FrameLayout root = new FrameLayout(ctx) {
-                @Override
-                protected void onConfigurationChanged(Configuration newConfig) {
-                    super.onConfigurationChanged(newConfig);
-                    setVisibility(newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
-                            ? View.GONE : View.VISIBLE);
-                }
-            };
+            final FrameLayout root = new FrameLayout(ctx);
             root.setBackground(bg);
             root.addView(label, new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
@@ -93,7 +88,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
             WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                     w0, h0,
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WINDOW_TYPE,
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                             | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                             | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
@@ -106,11 +101,32 @@ public class MainHook implements IXposedHookLoadPackage {
 
             final Island island = new Island(wm, root, label, bg, lp, d,
                     w0, h0, y0, w1, h1);
-            root.setOnClickListener(v -> island.toggle());
+            root.setOnClickListener(v -> {
+                XposedBridge.log("IslandMod: tap");
+                island.toggle();
+            });
 
             wm.addView(root, lp);
-            root.setVisibility(isLandscape(ctx) ? View.GONE : View.VISIBLE);
+            root.setVisibility(isLandscape(ctx.getResources().getConfiguration())
+                    ? View.GONE : View.VISIBLE);
+
+            // Hide in landscape and show again in portrait. This listens on the
+            // System UI app, so it still works while the island is hidden.
+            final Handler main = new Handler(Looper.getMainLooper());
+            ctx.registerComponentCallbacks(new ComponentCallbacks() {
+                @Override
+                public void onConfigurationChanged(Configuration newConfig) {
+                    final boolean land = isLandscape(newConfig);
+                    main.post(() -> root.setVisibility(land ? View.GONE : View.VISIBLE));
+                }
+
+                @Override
+                public void onLowMemory() {
+                }
+            });
+
             added = true;
+            XposedBridge.log("IslandMod: island added, window type " + WINDOW_TYPE);
         } catch (Throwable t) {
             XposedBridge.log("IslandMod: " + t);
         }

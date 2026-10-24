@@ -19,9 +19,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public class MainHook implements IXposedHookLoadPackage {
 
     // Tweak these to fit your Nothing Phone 3a camera cutout
-    private static final int PILL_WIDTH_DP = 150;
-    private static final int PILL_HEIGHT_DP = 34;
-    private static final int TOP_MARGIN_DP = 4;
+    private static final int PILL_WIDTH_DP = 110;
+    private static final int PILL_HEIGHT_DP = 32;
+    private static final int TOP_MARGIN_DP = 3;
 
     private static boolean added = false;
 

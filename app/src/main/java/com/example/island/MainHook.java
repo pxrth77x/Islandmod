@@ -3,18 +3,29 @@ package com.example.island;
 import android.animation.TimeInterpolator;
 import android.animation.ValueAnimator;
 import android.app.Application;
+import android.content.BroadcastReceiver;
 import android.content.ComponentCallbacks;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.res.Configuration;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.RectF;
+import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.os.BatteryManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -34,9 +45,13 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final int EXPANDED_W_DP = 330;
     private static final int EXPANDED_H_DP = 92;
     private static final long ANIM_MS = 550;
+    private static final long CHARGE_SHOW_MS = 3500;
 
     // Window layer above the status bar so the island receives taps
     private static final int WINDOW_TYPE = 2024; // TYPE_NAVIGATION_BAR_PANEL
+
+    private static final int GREEN = 0xFF30D158;
+    private static final int RED = 0xFFFF453A;
 
     private static boolean added = false;
 
@@ -57,6 +72,13 @@ public class MainHook implements IXposedHookLoadPackage {
         return c.orientation == Configuration.ORIENTATION_LANDSCAPE;
     }
 
+    private static void readBattery(Intent i, BatteryContent content) {
+        int level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+        boolean plugged = i.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
+        if (level >= 0 && scale > 0) content.set(level * 100 / scale, plugged);
+    }
+
     private static void addIsland(Context ctx) {
         if (added) return;
         try {
@@ -73,16 +95,12 @@ public class MainHook implements IXposedHookLoadPackage {
             bg.setColor(Color.BLACK);
             bg.setCornerRadius(h0 / 2f);
 
-            TextView label = new TextView(ctx);
-            label.setText("Dynamic Island");
-            label.setTextColor(Color.WHITE);
-            label.setTextSize(15f);
-            label.setGravity(Gravity.CENTER);
-            label.setAlpha(0f);
+            final BatteryContent content = new BatteryContent(ctx, d);
+            content.setAlpha(0f);
 
             final FrameLayout root = new FrameLayout(ctx);
             root.setBackground(bg);
-            root.addView(label, new FrameLayout.LayoutParams(
+            root.addView(content, new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.MATCH_PARENT));
 
@@ -99,7 +117,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
             lp.setTitle("IslandPill");
 
-            final Island island = new Island(wm, root, label, bg, lp, d,
+            final Island island = new Island(wm, root, content, bg, lp, d,
                     w0, h0, y0, w1, h1);
             root.setOnClickListener(v -> {
                 XposedBridge.log("IslandMod: tap");
@@ -110,8 +128,7 @@ public class MainHook implements IXposedHookLoadPackage {
             root.setVisibility(isLandscape(ctx.getResources().getConfiguration())
                     ? View.GONE : View.VISIBLE);
 
-            // Hide in landscape and show again in portrait. This listens on the
-            // System UI app, so it still works while the island is hidden.
+            // Hide in landscape and show again in portrait
             final Handler main = new Handler(Looper.getMainLooper());
             ctx.registerComponentCallbacks(new ComponentCallbacks() {
                 @Override
@@ -125,6 +142,34 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             });
 
+            // Charging: expand when the charger is plugged in
+            try {
+                BroadcastReceiver rcv = new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context c, Intent i) {
+                        String a = i.getAction();
+                        if (Intent.ACTION_BATTERY_CHANGED.equals(a)) {
+                            readBattery(i, content);
+                        } else if (Intent.ACTION_POWER_CONNECTED.equals(a)) {
+                            XposedBridge.log("IslandMod: power connected");
+                            content.setPlugged(true);
+                            island.showEvent(CHARGE_SHOW_MS);
+                        } else if (Intent.ACTION_POWER_DISCONNECTED.equals(a)) {
+                            XposedBridge.log("IslandMod: power disconnected");
+                            content.setPlugged(false);
+                        }
+                    }
+                };
+                IntentFilter f = new IntentFilter();
+                f.addAction(Intent.ACTION_BATTERY_CHANGED);
+                f.addAction(Intent.ACTION_POWER_CONNECTED);
+                f.addAction(Intent.ACTION_POWER_DISCONNECTED);
+                Intent sticky = ctx.registerReceiver(rcv, f, Context.RECEIVER_EXPORTED);
+                if (sticky != null) readBattery(sticky, content);
+            } catch (Throwable t) {
+                XposedBridge.log("IslandMod: receiver " + t);
+            }
+
             added = true;
             XposedBridge.log("IslandMod: island added, window type " + WINDOW_TYPE);
         } catch (Throwable t) {
@@ -136,26 +181,37 @@ public class MainHook implements IXposedHookLoadPackage {
     private static class Island {
         final WindowManager wm;
         final FrameLayout root;
-        final TextView label;
+        final View content;
         final GradientDrawable bg;
         final WindowManager.LayoutParams lp;
         final float d;
         final int w0, h0, y0, w1, h1;
+        final Handler h = new Handler(Looper.getMainLooper());
+        final Runnable collapse = () -> setExpanded(false);
         boolean expanded = false;
         float progress = 0f;
         ValueAnimator anim;
 
-        Island(WindowManager wm, FrameLayout root, TextView label, GradientDrawable bg,
+        Island(WindowManager wm, FrameLayout root, View content, GradientDrawable bg,
                WindowManager.LayoutParams lp, float d,
                int w0, int h0, int y0, int w1, int h1) {
-            this.wm = wm; this.root = root; this.label = label; this.bg = bg;
+            this.wm = wm; this.root = root; this.content = content; this.bg = bg;
             this.lp = lp; this.d = d;
             this.w0 = w0; this.h0 = h0; this.y0 = y0;
             this.w1 = w1; this.h1 = h1;
         }
 
         void toggle() {
+            h.removeCallbacks(collapse);
             setExpanded(!expanded);
+        }
+
+        /** Expand for a moment, then collapse by itself. */
+        void showEvent(long ms) {
+            if (root.getVisibility() != View.VISIBLE) return;
+            h.removeCallbacks(collapse);
+            setExpanded(true);
+            h.postDelayed(collapse, ms);
         }
 
         void setExpanded(boolean e) {
@@ -181,10 +237,134 @@ public class MainHook implements IXposedHookLoadPackage {
             lp.y = y0;
             bg.setCornerRadius(Math.min(lp.height / 2f, 38f * d));
             float a = (p - 0.55f) / 0.45f;
-            label.setAlpha(Math.max(0f, Math.min(1f, a)));
+            content.setAlpha(Math.max(0f, Math.min(1f, a)));
             try {
                 wm.updateViewLayout(root, lp);
             } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** Battery ring, title, status and percentage shown in the expanded island. */
+    private static class BatteryContent extends LinearLayout {
+        final BatteryRing ring;
+        final TextView title, sub, pct;
+        int level = 0;
+        boolean plugged = false;
+
+        BatteryContent(Context c, float d) {
+            super(c);
+            setOrientation(HORIZONTAL);
+            setGravity(Gravity.CENTER_VERTICAL);
+            int pad = (int) (24 * d);
+            setPadding(pad, 0, pad, 0);
+
+            ring = new BatteryRing(c, d);
+            addView(ring, new LinearLayout.LayoutParams((int) (44 * d), (int) (44 * d)));
+
+            LinearLayout texts = new LinearLayout(c);
+            texts.setOrientation(VERTICAL);
+            title = new TextView(c);
+            title.setTextColor(Color.WHITE);
+            title.setTextSize(16f);
+            title.setTypeface(Typeface.DEFAULT_BOLD);
+            sub = new TextView(c);
+            sub.setTextColor(0xB3FFFFFF);
+            sub.setTextSize(12f);
+            texts.addView(title);
+            texts.addView(sub);
+            LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            tp.leftMargin = (int) (14 * d);
+            addView(texts, tp);
+
+            pct = new TextView(c);
+            pct.setTextSize(24f);
+            pct.setTypeface(Typeface.DEFAULT_BOLD);
+            addView(pct, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+
+            refresh();
+        }
+
+        void set(int level, boolean plugged) {
+            this.level = level;
+            this.plugged = plugged;
+            refresh();
+        }
+
+        void setPlugged(boolean plugged) {
+            this.plugged = plugged;
+            refresh();
+        }
+
+        void refresh() {
+            ring.set(level, plugged);
+            title.setText(plugged ? "Charging" : "Battery");
+            if (plugged && level >= 100) sub.setText("Fully charged");
+            else if (plugged) sub.setText("Plugged in");
+            else if (level <= 15) sub.setText("Low battery");
+            else sub.setText("On battery");
+            pct.setText(level + "%");
+            pct.setTextColor(plugged ? GREEN : (level <= 15 ? RED : Color.WHITE));
+        }
+    }
+
+    /** Circular battery gauge with a lightning bolt while charging. */
+    private static class BatteryRing extends View {
+        final Paint track = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final Paint arc = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final Paint bolt = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final RectF rect = new RectF();
+        final Path path = new Path();
+        final float stroke;
+        int level = 0;
+        boolean charging = false;
+
+        BatteryRing(Context c, float d) {
+            super(c);
+            stroke = 4f * d;
+            track.setStyle(Paint.Style.STROKE);
+            track.setStrokeWidth(stroke);
+            track.setColor(0x33FFFFFF);
+            arc.setStyle(Paint.Style.STROKE);
+            arc.setStrokeWidth(stroke);
+            arc.setStrokeCap(Paint.Cap.ROUND);
+            bolt.setStyle(Paint.Style.FILL);
+            bolt.setColor(GREEN);
+        }
+
+        void set(int level, boolean charging) {
+            this.level = level;
+            this.charging = charging;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            float w = getWidth();
+            float h = getHeight();
+            float half = stroke / 2f;
+            rect.set(half, half, w - half, h - half);
+            c.drawArc(rect, 0f, 360f, false, track);
+
+            arc.setColor(charging ? GREEN : (level <= 15 ? RED : Color.WHITE));
+            c.drawArc(rect, -90f, 360f * level / 100f, false, arc);
+
+            if (charging) {
+                float cx = w / 2f;
+                float cy = h / 2f;
+                float s = w * 0.17f;
+                path.reset();
+                path.moveTo(cx + 0.3f * s, cy - 1.3f * s);
+                path.lineTo(cx - 0.7f * s, cy + 0.15f * s);
+                path.lineTo(cx - 0.05f * s, cy + 0.15f * s);
+                path.lineTo(cx - 0.3f * s, cy + 1.3f * s);
+                path.lineTo(cx + 0.7f * s, cy - 0.15f * s);
+                path.lineTo(cx + 0.05f * s, cy - 0.15f * s);
+                path.close();
+                c.drawPath(path, bolt);
             }
         }
     }

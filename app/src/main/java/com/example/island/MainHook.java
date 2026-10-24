@@ -3,6 +3,8 @@ package com.example.island;
 import android.animation.TimeInterpolator;
 import android.animation.ValueAnimator;
 import android.app.Application;
+import android.app.Notification;
+import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.ComponentCallbacks;
 import android.content.Context;
@@ -11,20 +13,29 @@ import android.content.IntentFilter;
 import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Outline;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.BatteryManager;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
+import android.service.notification.NotificationListenerService;
+import android.service.notification.StatusBarNotification;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -46,6 +57,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final int EXPANDED_H_DP = 92;
     private static final long ANIM_MS = 550;
     private static final long CHARGE_SHOW_MS = 3500;
+    private static final long NOTIF_SHOW_MS = 4500;
 
     // Window layer above the status bar so the island receives taps
     private static final int WINDOW_TYPE = 2024; // TYPE_NAVIGATION_BAR_PANEL
@@ -53,7 +65,15 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final int GREEN = 0xFF30D158;
     private static final int RED = 0xFFFF453A;
 
+    private static final int MODE_BATTERY = 0;
+    private static final int MODE_NOTIF = 1;
+
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static boolean added = false;
+    private static Island theIsland;
+    private static Context appCtx;
+    private static String lastSig = "";
+    private static long lastSigTime = 0;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -63,10 +83,105 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override
             protected void afterHookedMethod(MethodHookParam param) {
                 final Context ctx = (Context) param.thisObject;
-                new Handler(Looper.getMainLooper()).post(() -> addIsland(ctx));
+                MAIN.post(() -> addIsland(ctx));
             }
         });
+
+        hookNotifications(lpparam.classLoader);
     }
+
+    // ---------------------------------------------------------------- notifications
+
+    private static void hookNotifications(ClassLoader cl) {
+        try {
+            XC_MethodHook h = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.args == null || param.args.length == 0) return;
+                        if (param.args[0] instanceof StatusBarNotification) {
+                            onNotification((StatusBarNotification) param.args[0]);
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log("IslandMod: notif " + t);
+                    }
+                }
+            };
+            int n = 0;
+            Class<?> sysui = XposedHelpers.findClassIfExists(
+                    "com.android.systemui.statusbar.NotificationListener", cl);
+            if (sysui != null) {
+                n += XposedBridge.hookAllMethods(sysui, "onNotificationPosted", h).size();
+            }
+            n += XposedBridge.hookAllMethods(
+                    NotificationListenerService.class, "onNotificationPosted", h).size();
+            XposedBridge.log("IslandMod: notification hooks " + n);
+        } catch (Throwable t) {
+            XposedBridge.log("IslandMod: hookNotifications " + t);
+        }
+    }
+
+    private static String str(CharSequence s) {
+        return s == null ? "" : s.toString().trim();
+    }
+
+    private static void onNotification(StatusBarNotification sbn) {
+        final Island isl = theIsland;
+        final Context c = appCtx;
+        if (isl == null || c == null) return;
+
+        String pkg = sbn.getPackageName();
+        if ("com.android.systemui".equals(pkg) || "android".equals(pkg)) return;
+
+        Notification n = sbn.getNotification();
+        if (n == null) return;
+
+        int skip = Notification.FLAG_ONGOING_EVENT
+                | Notification.FLAG_FOREGROUND_SERVICE
+                | Notification.FLAG_GROUP_SUMMARY;
+        if ((n.flags & skip) != 0) return;
+
+        String cat = n.category;
+        if (Notification.CATEGORY_TRANSPORT.equals(cat)
+                || Notification.CATEGORY_PROGRESS.equals(cat)
+                || Notification.CATEGORY_SERVICE.equals(cat)) return;
+
+        Bundle ex = n.extras;
+        if (ex == null) return;
+
+        String title = str(ex.getCharSequence(Notification.EXTRA_TITLE));
+        if (title.isEmpty()) title = str(ex.getCharSequence(Notification.EXTRA_TITLE_BIG));
+        String text = str(ex.getCharSequence(Notification.EXTRA_TEXT));
+        if (text.isEmpty()) text = str(ex.getCharSequence(Notification.EXTRA_BIG_TEXT));
+        if (text.isEmpty()) text = str(ex.getCharSequence(Notification.EXTRA_SUB_TEXT));
+        if (title.isEmpty() && text.isEmpty()) return;
+        if (title.isEmpty()) {
+            title = text;
+            text = "";
+        }
+
+        // Ignore the same notification posted again straight away
+        String sig = sbn.getKey() + "|" + title + "|" + text;
+        long now = System.currentTimeMillis();
+        if (sig.equals(lastSig) && now - lastSigTime < 10000) return;
+        lastSig = sig;
+        lastSigTime = now;
+
+        Drawable icon = null;
+        try {
+            icon = c.getPackageManager().getApplicationIcon(pkg);
+        } catch (Throwable ignored) {
+        }
+
+        final Drawable fi = icon;
+        final String ft = title;
+        final String fx = text;
+        final PendingIntent pi = n.contentIntent;
+        XposedBridge.log("IslandMod: notification from " + pkg);
+        MAIN.post(() -> isl.showNotification(fi, ft, fx, pi, NOTIF_SHOW_MS));
+    }
+
+    // ---------------------------------------------------------------- island
 
     private static boolean isLandscape(Configuration c) {
         return c.orientation == Configuration.ORIENTATION_LANDSCAPE;
@@ -82,6 +197,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void addIsland(Context ctx) {
         if (added) return;
         try {
+            appCtx = ctx;
             WindowManager wm = ctx.getSystemService(WindowManager.class);
             float d = ctx.getResources().getDisplayMetrics().density;
 
@@ -95,12 +211,18 @@ public class MainHook implements IXposedHookLoadPackage {
             bg.setColor(Color.BLACK);
             bg.setCornerRadius(h0 / 2f);
 
-            final BatteryContent content = new BatteryContent(ctx, d);
-            content.setAlpha(0f);
+            final BatteryContent battery = new BatteryContent(ctx, d);
+            battery.setAlpha(0f);
+            final NotifContent notif = new NotifContent(ctx, d);
+            notif.setAlpha(0f);
+            notif.setVisibility(View.GONE);
 
             final FrameLayout root = new FrameLayout(ctx);
             root.setBackground(bg);
-            root.addView(content, new FrameLayout.LayoutParams(
+            root.addView(battery, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
+            root.addView(notif, new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.MATCH_PARENT));
 
@@ -117,11 +239,12 @@ public class MainHook implements IXposedHookLoadPackage {
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
             lp.setTitle("IslandPill");
 
-            final Island island = new Island(wm, root, content, bg, lp, d,
+            final Island isl = new Island(wm, root, battery, notif, bg, lp, d,
                     w0, h0, y0, w1, h1);
+            theIsland = isl;
             root.setOnClickListener(v -> {
                 XposedBridge.log("IslandMod: tap");
-                island.toggle();
+                isl.onTap();
             });
 
             wm.addView(root, lp);
@@ -129,12 +252,11 @@ public class MainHook implements IXposedHookLoadPackage {
                     ? View.GONE : View.VISIBLE);
 
             // Hide in landscape and show again in portrait
-            final Handler main = new Handler(Looper.getMainLooper());
             ctx.registerComponentCallbacks(new ComponentCallbacks() {
                 @Override
                 public void onConfigurationChanged(Configuration newConfig) {
                     final boolean land = isLandscape(newConfig);
-                    main.post(() -> root.setVisibility(land ? View.GONE : View.VISIBLE));
+                    MAIN.post(() -> root.setVisibility(land ? View.GONE : View.VISIBLE));
                 }
 
                 @Override
@@ -149,14 +271,14 @@ public class MainHook implements IXposedHookLoadPackage {
                     public void onReceive(Context c, Intent i) {
                         String a = i.getAction();
                         if (Intent.ACTION_BATTERY_CHANGED.equals(a)) {
-                            readBattery(i, content);
+                            readBattery(i, battery);
                         } else if (Intent.ACTION_POWER_CONNECTED.equals(a)) {
                             XposedBridge.log("IslandMod: power connected");
-                            content.setPlugged(true);
-                            island.showEvent(CHARGE_SHOW_MS);
+                            battery.setPlugged(true);
+                            isl.showEvent(CHARGE_SHOW_MS);
                         } else if (Intent.ACTION_POWER_DISCONNECTED.equals(a)) {
                             XposedBridge.log("IslandMod: power disconnected");
-                            content.setPlugged(false);
+                            battery.setPlugged(false);
                         }
                     }
                 };
@@ -165,7 +287,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 f.addAction(Intent.ACTION_POWER_CONNECTED);
                 f.addAction(Intent.ACTION_POWER_DISCONNECTED);
                 Intent sticky = ctx.registerReceiver(rcv, f, Context.RECEIVER_EXPORTED);
-                if (sticky != null) readBattery(sticky, content);
+                if (sticky != null) readBattery(sticky, battery);
             } catch (Throwable t) {
                 XposedBridge.log("IslandMod: receiver " + t);
             }
@@ -177,11 +299,12 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Controls the island size and animation. */
+    /** Controls the island size, content and animation. */
     private static class Island {
         final WindowManager wm;
         final FrameLayout root;
-        final View content;
+        final BatteryContent battery;
+        final NotifContent notif;
         final GradientDrawable bg;
         final WindowManager.LayoutParams lp;
         final float d;
@@ -190,25 +313,66 @@ public class MainHook implements IXposedHookLoadPackage {
         final Runnable collapse = () -> setExpanded(false);
         boolean expanded = false;
         float progress = 0f;
+        int mode = MODE_BATTERY;
+        PendingIntent currentIntent;
         ValueAnimator anim;
 
-        Island(WindowManager wm, FrameLayout root, View content, GradientDrawable bg,
-               WindowManager.LayoutParams lp, float d,
+        Island(WindowManager wm, FrameLayout root, BatteryContent battery, NotifContent notif,
+               GradientDrawable bg, WindowManager.LayoutParams lp, float d,
                int w0, int h0, int y0, int w1, int h1) {
-            this.wm = wm; this.root = root; this.content = content; this.bg = bg;
-            this.lp = lp; this.d = d;
+            this.wm = wm; this.root = root; this.battery = battery; this.notif = notif;
+            this.bg = bg; this.lp = lp; this.d = d;
             this.w0 = w0; this.h0 = h0; this.y0 = y0;
             this.w1 = w1; this.h1 = h1;
         }
 
-        void toggle() {
+        static float contentAlpha(float p) {
+            return Math.max(0f, Math.min(1f, (p - 0.55f) / 0.45f));
+        }
+
+        void setMode(int m) {
+            mode = m;
+            battery.setVisibility(m == MODE_BATTERY ? View.VISIBLE : View.GONE);
+            notif.setVisibility(m == MODE_NOTIF ? View.VISIBLE : View.GONE);
+            View active = m == MODE_NOTIF ? notif : battery;
+            active.setAlpha(contentAlpha(progress));
+        }
+
+        void onTap() {
             h.removeCallbacks(collapse);
+            if (expanded && mode == MODE_NOTIF) {
+                // Open the notification, then close the island
+                if (currentIntent != null) {
+                    try {
+                        currentIntent.send();
+                    } catch (Throwable t) {
+                        XposedBridge.log("IslandMod: open " + t);
+                    }
+                }
+                setExpanded(false);
+                return;
+            }
+            if (!expanded) setMode(MODE_BATTERY);
             setExpanded(!expanded);
         }
 
-        /** Expand for a moment, then collapse by itself. */
+        /** Charging: expand for a moment, then collapse by itself. */
         void showEvent(long ms) {
             if (root.getVisibility() != View.VISIBLE) return;
+            setMode(MODE_BATTERY);
+            h.removeCallbacks(collapse);
+            setExpanded(true);
+            h.postDelayed(collapse, ms);
+        }
+
+        void showNotification(Drawable icon, String t, String body,
+                              PendingIntent pi, long ms) {
+            if (root.getVisibility() != View.VISIBLE) return;
+            PowerManager pm = root.getContext().getSystemService(PowerManager.class);
+            if (pm != null && !pm.isInteractive()) return;
+            notif.set(icon, t, body);
+            currentIntent = pi;
+            setMode(MODE_NOTIF);
             h.removeCallbacks(collapse);
             setExpanded(true);
             h.postDelayed(collapse, ms);
@@ -236,8 +400,8 @@ public class MainHook implements IXposedHookLoadPackage {
             lp.height = Math.max(1, (int) (h0 + (h1 - h0) * p));
             lp.y = y0;
             bg.setCornerRadius(Math.min(lp.height / 2f, 38f * d));
-            float a = (p - 0.55f) / 0.45f;
-            content.setAlpha(Math.max(0f, Math.min(1f, a)));
+            View active = mode == MODE_NOTIF ? notif : battery;
+            active.setAlpha(contentAlpha(p));
             try {
                 wm.updateViewLayout(root, lp);
             } catch (Throwable ignored) {
@@ -245,7 +409,59 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Battery ring, title, status and percentage shown in the expanded island. */
+    /** App icon, title and message shown for a notification. */
+    private static class NotifContent extends LinearLayout {
+        final ImageView icon;
+        final TextView title, text;
+
+        NotifContent(Context c, final float d) {
+            super(c);
+            setOrientation(HORIZONTAL);
+            setGravity(Gravity.CENTER_VERTICAL);
+            int pad = (int) (22 * d);
+            setPadding(pad, 0, pad, 0);
+
+            icon = new ImageView(c);
+            icon.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            icon.setOutlineProvider(new ViewOutlineProvider() {
+                @Override
+                public void getOutline(View v, Outline o) {
+                    o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), 10 * d);
+                }
+            });
+            icon.setClipToOutline(true);
+            addView(icon, new LinearLayout.LayoutParams((int) (44 * d), (int) (44 * d)));
+
+            LinearLayout texts = new LinearLayout(c);
+            texts.setOrientation(VERTICAL);
+            title = new TextView(c);
+            title.setTextColor(Color.WHITE);
+            title.setTextSize(15f);
+            title.setTypeface(Typeface.DEFAULT_BOLD);
+            title.setMaxLines(1);
+            title.setEllipsize(TextUtils.TruncateAt.END);
+            text = new TextView(c);
+            text.setTextColor(0xCCFFFFFF);
+            text.setTextSize(13f);
+            text.setMaxLines(2);
+            text.setEllipsize(TextUtils.TruncateAt.END);
+            texts.addView(title);
+            texts.addView(text);
+            LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            tp.leftMargin = (int) (14 * d);
+            addView(texts, tp);
+        }
+
+        void set(Drawable appIcon, String t, String body) {
+            icon.setImageDrawable(appIcon);
+            title.setText(t);
+            text.setText(body);
+            text.setVisibility(body == null || body.isEmpty() ? View.GONE : View.VISIBLE);
+        }
+    }
+
+    /** Battery ring, title, status and percentage shown for charging. */
     private static class BatteryContent extends LinearLayout {
         final BatteryRing ring;
         final TextView title, sub, pct;

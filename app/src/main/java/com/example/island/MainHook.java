@@ -21,7 +21,7 @@ public class MainHook implements IXposedHookLoadPackage {
     // Tweak these to fit your Nothing Phone 3a camera cutout
     private static final int PILL_WIDTH_DP = 110;
     private static final int PILL_HEIGHT_DP = 30;
-    private static final int TOP_MARGIN_DP = 8;
+    private static final int TOP_MARGIN_DP = 10;
 
     private static boolean added = false;
 

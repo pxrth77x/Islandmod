@@ -68,12 +68,18 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final int MODE_BATTERY = 0;
     private static final int MODE_NOTIF = 1;
 
-    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static Handler mainHandler;
     private static boolean added = false;
     private static Island theIsland;
     private static Context appCtx;
     private static String lastSig = "";
     private static long lastSigTime = 0;
+
+    /** Created only when first used, never while the class loads. */
+    private static Handler main() {
+        if (mainHandler == null) mainHandler = new Handler(Looper.getMainLooper());
+        return mainHandler;
+    }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -83,7 +89,7 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override
             protected void afterHookedMethod(MethodHookParam param) {
                 final Context ctx = (Context) param.thisObject;
-                MAIN.post(() -> addIsland(ctx));
+                main().post(() -> addIsland(ctx));
             }
         });
 
@@ -178,7 +184,7 @@ public class MainHook implements IXposedHookLoadPackage {
         final String fx = text;
         final PendingIntent pi = n.contentIntent;
         XposedBridge.log("IslandMod: notification from " + pkg);
-        MAIN.post(() -> isl.showNotification(fi, ft, fx, pi, NOTIF_SHOW_MS));
+        main().post(() -> isl.showNotification(fi, ft, fx, pi, NOTIF_SHOW_MS));
     }
 
     // ---------------------------------------------------------------- island
@@ -256,7 +262,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 public void onConfigurationChanged(Configuration newConfig) {
                     final boolean land = isLandscape(newConfig);
-                    MAIN.post(() -> root.setVisibility(land ? View.GONE : View.VISIBLE));
+                    main().post(() -> root.setVisibility(land ? View.GONE : View.VISIBLE));
                 }
 
                 @Override

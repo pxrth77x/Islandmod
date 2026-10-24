@@ -5,6 +5,7 @@ import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
 import android.app.Application;
 import android.app.Notification;
+import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.ComponentCallbacks;
@@ -38,6 +39,7 @@ import android.os.PowerManager;
 import android.os.SystemClock;
 import android.service.notification.NotificationListenerService;
 import android.service.notification.StatusBarNotification;
+import android.telecom.TelecomManager;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
@@ -84,7 +86,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final int GREEN = 0xFF30D158;
     private static final int RED = 0xFFFF453A;
     private static final int DEFAULT_ACCENT = 0xFF8E8E93;
-    private static final int GLASS = 0xE8161618;
+    private static final int GLASS = 0xF4151517;
 
     private static final int MODE_BATTERY = 0;
     private static final int MODE_MEDIA = 1;
@@ -99,6 +101,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static boolean added = false;
     private static Island theIsland;
     private static Context appCtx;
+    private static String recKey;
 
     /** Created only when first used, never while the class loads. */
     private static Handler main() {
@@ -211,6 +214,17 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
+    /** The real recording notification: ongoing, has a Stop action and no progress bar. */
+    private static boolean isRecordingNotif(Notification n) {
+        if ((n.flags & Notification.FLAG_ONGOING_EVENT) == 0) return false;
+        Bundle ex = n.extras;
+        if (ex != null) {
+            if (ex.getInt(Notification.EXTRA_PROGRESS_MAX, 0) > 0) return false;
+            if (ex.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false)) return false;
+        }
+        return n.actions != null && n.actions.length > 0;
+    }
+
     private interface SeekListener {
         void onSeek(float fraction);
     }
@@ -270,13 +284,25 @@ public class MainHook implements IXposedHookLoadPackage {
         if (n == null) return;
         String pkg = sbn.getPackageName();
 
-        // Screen recording: the ongoing notification System UI posts while recording
+        // Screen recording
         if ("screen_record".equals(n.getChannelId())) {
-            if ((n.flags & Notification.FLAG_ONGOING_EVENT) != 0) {
+            String key = sbn.getKey();
+            if (removed) {
+                if (key != null && key.equals(recKey)) {
+                    recKey = null;
+                    main().post(() -> isl.setRecording(false, null, 0));
+                }
+                return;
+            }
+            if (isRecordingNotif(n)) {
+                recKey = key;
                 final PendingIntent stop = findAction(n, new String[]{"stop"}, true);
                 final long when = sbn.getPostTime();
-                final boolean on = !removed;
-                main().post(() -> isl.setRecording(on, stop, when));
+                main().post(() -> isl.setRecording(true, stop, when));
+            } else if (recKey != null) {
+                // "processing" or "saved" notification: the recording is over
+                recKey = null;
+                main().post(() -> isl.setRecording(false, null, 0));
             }
             return;
         }
@@ -302,11 +328,25 @@ public class MainHook implements IXposedHookLoadPackage {
                     || type == Notification.CallStyle.CALL_TYPE_SCREENING
                     || (type == 0 && count >= 2);
 
-            PendingIntent answer = findAction(n,
-                    new String[]{"answer", "accept", "pick"}, false);
-            PendingIntent decline = findAction(n,
-                    new String[]{"decline", "reject", "hang", "end", "dismiss", "disconnect"},
-                    false);
+            PendingIntent answer = null;
+            PendingIntent decline = null;
+            // Call-style notifications keep their real intents in the extras
+            try {
+                answer = (PendingIntent) ex.getParcelable(Notification.EXTRA_ANSWER_INTENT);
+                decline = (PendingIntent) ex.getParcelable(Notification.EXTRA_DECLINE_INTENT);
+                if (decline == null) {
+                    decline = (PendingIntent) ex.getParcelable(Notification.EXTRA_HANG_UP_INTENT);
+                }
+            } catch (Throwable ignored) {
+            }
+            if (answer == null) {
+                answer = findAction(n, new String[]{"answer", "accept", "pick"}, false);
+            }
+            if (decline == null) {
+                decline = findAction(n,
+                        new String[]{"decline", "reject", "hang", "end", "dismiss", "disconnect"},
+                        false);
+            }
             if (n.actions != null) {
                 if (incoming && count >= 2) {
                     if (decline == null) decline = n.actions[0].actionIntent;
@@ -315,6 +355,9 @@ public class MainHook implements IXposedHookLoadPackage {
                     decline = n.actions[0].actionIntent;
                 }
             }
+            XposedBridge.log("IslandMod: call pkg=" + pkg + " incoming=" + incoming
+                    + " actions=" + count + " answer=" + (answer != null)
+                    + " decline=" + (decline != null));
 
             Drawable icon = null;
             try {
@@ -362,6 +405,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     (int) (TOP_MARGIN_DP * d));
             theIsland = isl;
 
+            // The pill first, the card on top of it
+            wm.addView(isl.pillView, isl.pillLp);
             wm.addView(isl.card, isl.lp);
             isl.setHidden(isLandscape(ctx.getResources().getConfiguration()));
 
@@ -418,7 +463,7 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             added = true;
-            XposedBridge.log("IslandMod: island added, window type " + WINDOW_TYPE);
+            XposedBridge.log("IslandMod: island added v3, window type " + WINDOW_TYPE);
         } catch (Throwable t) {
             XposedBridge.log("IslandMod: " + t);
         }
@@ -427,8 +472,8 @@ public class MainHook implements IXposedHookLoadPackage {
     // ---------------------------------------------------------------- island
 
     /**
-     * The island window. The window only changes size when it opens or closes.
-     * The animation moves a rounded shape inside the window, so it stays smooth.
+     * Three small windows: the pill, the card (shown only while expanded) and the
+     * recording bubble. No window changes size while animating, so nothing jumps.
      */
     private static class Island {
         final Context ctx;
@@ -436,16 +481,22 @@ public class MainHook implements IXposedHookLoadPackage {
         final float d;
         final int w0, h0, y0;
         final Handler h = new Handler(Looper.getMainLooper());
-        final Card card;
-        final FrameLayout pill;
+
+        // pill window
+        final FrameLayout pillView;
+        final WindowManager.LayoutParams pillLp;
         final ImageView leftIcon;
         final RightIndicator rightInd;
+
+        // card window
+        final Card card;
+        final WindowManager.LayoutParams lp;
         final BatteryContent battery;
         final MediaContent media;
         final CallContent call;
         final RecordContent record;
         final View[] contents;
-        final WindowManager.LayoutParams lp;
+
         final Bubble bubble;
         final Runnable collapse = () -> close();
         final Runnable ticker = () -> tick();
@@ -461,6 +512,7 @@ public class MainHook implements IXposedHookLoadPackage {
         boolean expanded = false;
         float p = 0f;
         int mode = MODE_BATTERY;
+        int cardH = 0;
         long autoMs = 0;
         ValueAnimator anim;
 
@@ -476,6 +528,7 @@ public class MainHook implements IXposedHookLoadPackage {
         boolean recording = false;
         PendingIntent recStop;
         long recStart = 0;
+        long recSince = 0;
 
         // media
         boolean mediaActive = false, mediaPlaying = false;
@@ -497,24 +550,12 @@ public class MainHook implements IXposedHookLoadPackage {
             this.h0 = h0;
             this.y0 = y0;
 
-            card = new Card(ctx, d, w0, h0);
-            battery = new BatteryContent(ctx, d);
-            media = new MediaContent(ctx, d);
-            call = new CallContent(ctx, d);
-            record = new RecordContent(ctx, d);
-            contents = new View[]{battery, media, call, record};
-            for (View v : contents) {
-                v.setAlpha(0f);
-                v.setVisibility(View.GONE);
-                card.addView(v, new FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT));
-            }
-
-            // Collapsed pill layer: always the size of the pill, centred at the top
-            pill = new FrameLayout(ctx);
-            card.addView(pill, new FrameLayout.LayoutParams(
-                    w0, h0, Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+            // ----- pill window
+            pillView = new FrameLayout(ctx);
+            GradientDrawable pbg = new GradientDrawable();
+            pbg.setColor(Color.BLACK);
+            pbg.setCornerRadius(h0 / 2f);
+            pillView.setBackground(pbg);
 
             int sz = (int) (20 * d);
             leftIcon = new ImageView(ctx);
@@ -530,17 +571,46 @@ public class MainHook implements IXposedHookLoadPackage {
             FrameLayout.LayoutParams llp = new FrameLayout.LayoutParams(
                     sz, sz, Gravity.START | Gravity.CENTER_VERTICAL);
             llp.leftMargin = (int) (10 * d);
-            pill.addView(leftIcon, llp);
+            pillView.addView(leftIcon, llp);
 
             rightInd = new RightIndicator(ctx, d);
             rightInd.setVisibility(View.INVISIBLE);
             FrameLayout.LayoutParams rlp = new FrameLayout.LayoutParams(
                     sz, sz, Gravity.END | Gravity.CENTER_VERTICAL);
             rlp.rightMargin = (int) (10 * d);
-            pill.addView(rightInd, rlp);
+            pillView.addView(rightInd, rlp);
+
+            pillLp = new WindowManager.LayoutParams(
+                    w0, h0,
+                    WINDOW_TYPE,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                            | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                    PixelFormat.TRANSLUCENT);
+            pillLp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+            pillLp.y = y0;
+            pillLp.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+            pillLp.setTitle("IslandPill");
+
+            // ----- card window
+            card = new Card(ctx, d, w0, h0);
+            battery = new BatteryContent(ctx, d);
+            media = new MediaContent(ctx, d);
+            call = new CallContent(ctx, d);
+            record = new RecordContent(ctx, d);
+            contents = new View[]{battery, media, call, record};
+            for (View v : contents) {
+                v.setAlpha(0f);
+                v.setVisibility(View.GONE);
+                card.addView(v, new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT));
+            }
+            card.setVisibility(View.GONE);
 
             lp = new WindowManager.LayoutParams(
-                    w0, h0,
+                    expW(), expH(MODE_BATTERY),
                     WINDOW_TYPE,
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                             | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
@@ -550,16 +620,17 @@ public class MainHook implements IXposedHookLoadPackage {
             lp.y = y0;
             lp.layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
-            lp.setTitle("IslandPill");
+            lp.setTitle("IslandCard");
 
+            pillView.setOnClickListener(v -> onTap());
             card.setOnClickListener(v -> onTap());
 
             call.decline.setOnClickListener(v -> {
-                sendPi(callDecline);
+                declineCall();
                 touched();
             });
             call.answer.setOnClickListener(v -> {
-                sendPi(callAnswer);
+                answerCall();
                 touched();
             });
             record.stop.setOnClickListener(v -> {
@@ -618,15 +689,6 @@ public class MainHook implements IXposedHookLoadPackage {
             return (int) ((m == MODE_MEDIA ? H_MEDIA_DP : H_SMALL_DP) * d);
         }
 
-        void applyWindow(int w, int hh) {
-            lp.width = w;
-            lp.height = hh;
-            try {
-                wm.updateViewLayout(card, lp);
-            } catch (Throwable ignored) {
-            }
-        }
-
         void showContents(boolean on) {
             for (int i = 0; i < contents.length; i++) {
                 contents[i].setVisibility(on && i == mode ? View.VISIBLE : View.GONE);
@@ -637,7 +699,7 @@ public class MainHook implements IXposedHookLoadPackage {
             return clamp01((v - 0.4f) / 0.5f);
         }
 
-        /** Runs r once the window has the new size, so the first frame is never wrong. */
+        /** Runs r once the card window has the new size, so the first frame is correct. */
         void waitLayout(final int w, final int hh, final Runnable r) {
             final boolean[] done = {false};
             final View.OnLayoutChangeListener[] ls = new View.OnLayoutChangeListener[1];
@@ -685,15 +747,19 @@ public class MainHook implements IXposedHookLoadPackage {
             p = v;
             card.setP(v);
             contents[mode].setAlpha(contentAlpha(v));
-            float ia = 1f - clamp01(v / 0.3f);
-            pill.setAlpha(ia);
+            float ia = 1f - clamp01(v / 0.5f);
+            pillView.setAlpha(ia);
             bubble.view.setAlpha(ia);
         }
 
         void onSettled() {
             if (!expanded && p <= 0.001f) {
                 showContents(false);
-                applyWindow(w0, h0);
+                card.setVisibility(View.GONE);
+                pillView.setAlpha(1f);
+                pillView.setVisibility(hidden ? View.GONE : View.VISIBLE);
+            } else if (expanded && p >= 0.999f) {
+                pillView.setVisibility(View.INVISIBLE);
             }
             updateBubble();
             startProgress();
@@ -705,14 +771,18 @@ public class MainHook implements IXposedHookLoadPackage {
 
         void setHidden(boolean hd) {
             hidden = hd;
-            card.setVisibility(hd ? View.GONE : View.VISIBLE);
             if (hd) {
                 h.removeCallbacks(collapse);
                 if (anim != null) anim.cancel();
                 expanded = false;
-                apply(0f);
+                p = 0f;
+                card.setP(0f);
                 showContents(false);
-                applyWindow(w0, h0);
+                card.setVisibility(View.GONE);
+                pillView.setVisibility(View.GONE);
+            } else {
+                pillView.setAlpha(1f);
+                pillView.setVisibility(View.VISIBLE);
             }
             updateBubble();
         }
@@ -742,6 +812,20 @@ public class MainHook implements IXposedHookLoadPackage {
 
         void open(int m, long ms) {
             if (hidden) return;
+            int w = expW();
+            int hh = expH(m);
+
+            // A card of a different height replaces the old one while it is not visible
+            if (card.getVisibility() == View.VISIBLE && cardH != hh) {
+                if (anim != null) anim.cancel();
+                p = 0f;
+                card.setP(0f);
+                card.setVisibility(View.GONE);
+                pillView.setAlpha(1f);
+                pillView.setVisibility(View.VISIBLE);
+            }
+            boolean shown = card.getVisibility() == View.VISIBLE;
+
             mode = m;
             autoMs = ms;
             expanded = true;
@@ -749,12 +833,23 @@ public class MainHook implements IXposedHookLoadPackage {
             contents[mode].setAlpha(contentAlpha(p));
             refreshContent();
             updateBubble();
-            int w = expW();
-            int hh = expH(m);
-            boolean same = card.getWidth() == w && card.getHeight() == hh;
-            applyWindow(w, hh);
-            if (same) animateTo(1f);
-            else waitLayout(w, hh, () -> animateTo(1f));
+
+            if (!shown) {
+                lp.width = w;
+                lp.height = hh;
+                try {
+                    wm.updateViewLayout(card, lp);
+                } catch (Throwable ignored) {
+                }
+                p = 0f;
+                card.setP(0f);
+                card.setVisibility(View.VISIBLE);
+                cardH = hh;
+                waitLayout(w, hh, () -> animateTo(1f));
+            } else {
+                animateTo(1f);
+            }
+            if (pillView.getVisibility() != View.GONE) pillView.setVisibility(View.VISIBLE);
             schedule(ms);
         }
 
@@ -762,6 +857,7 @@ public class MainHook implements IXposedHookLoadPackage {
             h.removeCallbacks(collapse);
             if (!expanded) return;
             expanded = false;
+            if (!hidden) pillView.setVisibility(View.VISIBLE);
             updateBubble();
             animateTo(0f);
         }
@@ -795,6 +891,41 @@ public class MainHook implements IXposedHookLoadPackage {
 
         // ---------------- call
 
+        void answerCall() {
+            XposedBridge.log("IslandMod: answer tap, intent=" + (callAnswer != null));
+            sendPi(callAnswer);
+            // If the call is still ringing a moment later, answer through Android's call system
+            h.postDelayed(() -> {
+                if (callState != CALL_RINGING) return;
+                try {
+                    TelecomManager tm = ctx.getSystemService(TelecomManager.class);
+                    if (tm != null) {
+                        tm.acceptRingingCall();
+                        XposedBridge.log("IslandMod: acceptRingingCall");
+                    }
+                } catch (Throwable t) {
+                    XposedBridge.log("IslandMod: acceptRingingCall " + t);
+                }
+            }, 700);
+        }
+
+        void declineCall() {
+            XposedBridge.log("IslandMod: decline tap, intent=" + (callDecline != null));
+            sendPi(callDecline);
+            h.postDelayed(() -> {
+                if (callState == CALL_NONE) return;
+                try {
+                    TelecomManager tm = ctx.getSystemService(TelecomManager.class);
+                    if (tm != null) {
+                        tm.endCall();
+                        XposedBridge.log("IslandMod: endCall");
+                    }
+                } catch (Throwable t) {
+                    XposedBridge.log("IslandMod: endCall " + t);
+                }
+            }, 700);
+        }
+
         void setCall(int state, String key, String title, Drawable icon,
                      PendingIntent answer, PendingIntent decline) {
             if (state == CALL_NONE) {
@@ -819,7 +950,7 @@ public class MainHook implements IXposedHookLoadPackage {
             if (state == CALL_ONGOING && prev != CALL_ONGOING) {
                 callStart = System.currentTimeMillis();
             }
-            call.set(state, title, icon, answer != null, decline != null);
+            call.set(state, title, icon, true, true);
             tickTexts();
             updateIndicators();
             startTicker();
@@ -836,6 +967,22 @@ public class MainHook implements IXposedHookLoadPackage {
 
         // ---------------- screen recording
 
+        boolean recordingNotifActive() {
+            try {
+                NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+                for (StatusBarNotification s : nm.getActiveNotifications()) {
+                    Notification n = s.getNotification();
+                    if (n != null && "screen_record".equals(n.getChannelId())
+                            && isRecordingNotif(n)) {
+                        return true;
+                    }
+                }
+                return false;
+            } catch (Throwable t) {
+                return true; // unknown: keep showing
+            }
+        }
+
         void setRecording(boolean on, PendingIntent stop, long start) {
             if (on == recording) {
                 if (on) recStop = stop;
@@ -843,7 +990,12 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             recording = on;
             recStop = on ? stop : null;
-            if (on) recStart = start > 0 ? start : System.currentTimeMillis();
+            if (on) {
+                recStart = start > 0 ? start : System.currentTimeMillis();
+                recSince = SystemClock.elapsedRealtime();
+            } else {
+                recKey = null;
+            }
             XposedBridge.log("IslandMod: recording " + on);
             tickTexts();
             startTicker();
@@ -981,7 +1133,7 @@ public class MainHook implements IXposedHookLoadPackage {
         void refreshContent() {
             media.set(mediaTitle, mediaArtist, mediaArt, mediaPlaying);
             media.setApp(appIcon);
-            call.set(callState, callTitle, callIcon, callAnswer != null, callDecline != null);
+            call.set(callState, callTitle, callIcon, true, true);
             tickTexts();
             updateProgress();
             applyAccent();
@@ -998,6 +1150,11 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         void tick() {
+            // Safety net: if the recording notification is gone, the recording is over
+            if (recording && SystemClock.elapsedRealtime() - recSince > 2500
+                    && !recordingNotifActive()) {
+                setRecording(false, null, 0);
+            }
             tickTexts();
             if (callState == CALL_ONGOING || recording) h.postDelayed(ticker, 1000);
         }
@@ -1442,14 +1599,12 @@ public class MainHook implements IXposedHookLoadPackage {
         @Override
         public boolean onTouchEvent(MotionEvent e) {
             int a = e.getActionMasked();
-            if (a == MotionEvent.ACTION_DOWN) return true;
             if (a == MotionEvent.ACTION_UP) {
                 float pad = 4f * d;
                 float w = getWidth() - 2 * pad;
                 if (w > 0 && listener != null) {
                     listener.onSeek(clamp01((e.getX() - pad) / w));
                 }
-                return true;
             }
             return true;
         }

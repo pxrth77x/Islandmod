@@ -27,6 +27,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.Icon;
+import android.hardware.display.DisplayManager;
 import android.media.MediaMetadata;
 import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
@@ -42,8 +43,10 @@ import android.service.notification.StatusBarNotification;
 import android.telecom.TelecomManager;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.MotionEvent;
+import android.view.Surface;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
@@ -77,7 +80,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final long CHARGE_SHOW_MS = 3500;
     private static final long MEDIA_SHOW_MS = 4500;
-    private static final long RECORD_SHOW_MS = 3000;
     private static final long TAP_SHOW_MS = 8000;
 
     // Window layer above the status bar so the island receives taps
@@ -408,20 +410,38 @@ public class MainHook implements IXposedHookLoadPackage {
             // The pill first, the card on top of it
             wm.addView(isl.pillView, isl.pillLp);
             wm.addView(isl.card, isl.lp);
-            isl.setHidden(isLandscape(ctx.getResources().getConfiguration()));
+            isl.checkRotation();
 
-            // Hide in landscape and show again in portrait
+            // Hide in landscape and show again in portrait (two independent triggers)
             ctx.registerComponentCallbacks(new ComponentCallbacks() {
                 @Override
                 public void onConfigurationChanged(Configuration newConfig) {
-                    final boolean land = isLandscape(newConfig);
-                    main().post(() -> isl.setHidden(land));
+                    main().post(() -> isl.checkRotation());
                 }
 
                 @Override
                 public void onLowMemory() {
                 }
             });
+            try {
+                DisplayManager dm = ctx.getSystemService(DisplayManager.class);
+                dm.registerDisplayListener(new DisplayManager.DisplayListener() {
+                    @Override
+                    public void onDisplayAdded(int displayId) {
+                    }
+
+                    @Override
+                    public void onDisplayRemoved(int displayId) {
+                    }
+
+                    @Override
+                    public void onDisplayChanged(int displayId) {
+                        main().post(() -> isl.checkRotation());
+                    }
+                }, main());
+            } catch (Throwable t) {
+                XposedBridge.log("IslandMod: display listener " + t);
+            }
 
             // Charging
             try {
@@ -463,7 +483,7 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             added = true;
-            XposedBridge.log("IslandMod: island added v3, window type " + WINDOW_TYPE);
+            XposedBridge.log("IslandMod: island added v4, window type " + WINDOW_TYPE);
         } catch (Throwable t) {
             XposedBridge.log("IslandMod: " + t);
         }
@@ -474,12 +494,14 @@ public class MainHook implements IXposedHookLoadPackage {
     /**
      * Three small windows: the pill, the card (shown only while expanded) and the
      * recording bubble. No window changes size while animating, so nothing jumps.
+     * The pill only exists while a call or music is running.
      */
     private static class Island {
         final Context ctx;
         final WindowManager wm;
         final float d;
         final int w0, h0, y0;
+        final float camRatio;
         final Handler h = new Handler(Looper.getMainLooper());
 
         // pill window
@@ -509,6 +531,7 @@ public class MainHook implements IXposedHookLoadPackage {
         };
 
         boolean hidden = false;
+        boolean pillOn = false;
         boolean expanded = false;
         float p = 0f;
         int mode = MODE_BATTERY;
@@ -549,8 +572,9 @@ public class MainHook implements IXposedHookLoadPackage {
             this.w0 = w0;
             this.h0 = h0;
             this.y0 = y0;
+            this.camRatio = (float) h0 / (float) w0;
 
-            // ----- pill window
+            // ----- pill window (starts hidden: only shown while something runs)
             pillView = new FrameLayout(ctx);
             GradientDrawable pbg = new GradientDrawable();
             pbg.setColor(Color.BLACK);
@@ -579,6 +603,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     sz, sz, Gravity.END | Gravity.CENTER_VERTICAL);
             rlp.rightMargin = (int) (10 * d);
             pillView.addView(rightInd, rlp);
+            pillView.setVisibility(View.GONE);
 
             pillLp = new WindowManager.LayoutParams(
                     w0, h0,
@@ -672,10 +697,27 @@ public class MainHook implements IXposedHookLoadPackage {
             media.app.setOnClickListener(v -> openApp());
             media.bar.setSeekListener(f -> seek(f));
 
-            bubble = new Bubble(ctx, wm, d, w0, h0, y0);
+            bubble = new Bubble(ctx, wm, d, h0, y0);
+            bubble.place(h0 / 2);
             bubble.view.setOnClickListener(v -> {
                 if (recording && !expanded && !hidden) open(MODE_RECORD, 0);
             });
+        }
+
+        // ---------------- rotation
+
+        /** Hides everything in landscape, using the real display rotation. */
+        void checkRotation() {
+            boolean land = false;
+            try {
+                DisplayManager dm = ctx.getSystemService(DisplayManager.class);
+                Display disp = dm.getDisplay(Display.DEFAULT_DISPLAY);
+                int r = disp.getRotation();
+                land = r == Surface.ROTATION_90 || r == Surface.ROTATION_270;
+            } catch (Throwable t) {
+                land = isLandscape(ctx.getResources().getConfiguration());
+            }
+            if (land != hidden) setHidden(land);
         }
 
         // ---------------- window and animation
@@ -748,7 +790,7 @@ public class MainHook implements IXposedHookLoadPackage {
             card.setP(v);
             contents[mode].setAlpha(contentAlpha(v));
             float ia = 1f - clamp01(v / 0.5f);
-            pillView.setAlpha(ia);
+            if (pillOn) pillView.setAlpha(ia);
             bubble.view.setAlpha(ia);
         }
 
@@ -756,16 +798,57 @@ public class MainHook implements IXposedHookLoadPackage {
             if (!expanded && p <= 0.001f) {
                 showContents(false);
                 card.setVisibility(View.GONE);
-                pillView.setAlpha(1f);
-                pillView.setVisibility(hidden ? View.GONE : View.VISIBLE);
+                if (pillOn) {
+                    pillView.setVisibility(View.VISIBLE);
+                    pillView.setScaleX(1f);
+                    pillView.setAlpha(1f);
+                } else {
+                    pillView.setVisibility(View.GONE);
+                }
             } else if (expanded && p >= 0.999f) {
-                pillView.setVisibility(View.INVISIBLE);
+                if (pillOn) pillView.setVisibility(View.INVISIBLE);
             }
             updateBubble();
             startProgress();
         }
 
+        /** The pill exists only while a call or music is running; otherwise it hides in the camera. */
+        void syncPill() {
+            boolean want = !hidden && (callState != CALL_NONE || mediaPlaying);
+            if (want == pillOn) return;
+            pillOn = want;
+            pillView.animate().cancel();
+            if (want) {
+                if (expanded) {
+                    pillView.setScaleX(1f);
+                    pillView.setVisibility(p >= 0.999f ? View.INVISIBLE : View.VISIBLE);
+                } else {
+                    pillView.setVisibility(View.VISIBLE);
+                    pillView.setScaleX(camRatio);
+                    pillView.setAlpha(0f);
+                    pillView.animate().scaleX(1f).alpha(1f).setDuration(260).start();
+                }
+            } else {
+                if (hidden || expanded) {
+                    pillView.setVisibility(View.GONE);
+                    pillView.setScaleX(1f);
+                    pillView.setAlpha(1f);
+                } else {
+                    pillView.animate().scaleX(camRatio).alpha(0f).setDuration(220)
+                            .withEndAction(() -> {
+                                if (!pillOn) {
+                                    pillView.setVisibility(View.GONE);
+                                    pillView.setScaleX(1f);
+                                    pillView.setAlpha(1f);
+                                }
+                            }).start();
+                }
+            }
+            updateBubble();
+        }
+
         void updateBubble() {
+            bubble.place(pillOn ? w0 / 2 : h0 / 2);
             bubble.show(recording && !expanded && !hidden);
         }
 
@@ -779,11 +862,8 @@ public class MainHook implements IXposedHookLoadPackage {
                 card.setP(0f);
                 showContents(false);
                 card.setVisibility(View.GONE);
-                pillView.setVisibility(View.GONE);
-            } else {
-                pillView.setAlpha(1f);
-                pillView.setVisibility(View.VISIBLE);
             }
+            syncPill();
             updateBubble();
         }
 
@@ -794,9 +874,9 @@ public class MainHook implements IXposedHookLoadPackage {
             return pm == null || pm.isInteractive();
         }
 
+        /** What a tap on the pill opens. Recording is only reachable through the red dot. */
         int topMode() {
             if (callState != CALL_NONE) return MODE_CALL;
-            if (recording) return MODE_RECORD;
             if (mediaActive) return MODE_MEDIA;
             return MODE_BATTERY;
         }
@@ -821,8 +901,10 @@ public class MainHook implements IXposedHookLoadPackage {
                 p = 0f;
                 card.setP(0f);
                 card.setVisibility(View.GONE);
-                pillView.setAlpha(1f);
-                pillView.setVisibility(View.VISIBLE);
+                if (pillOn) {
+                    pillView.setAlpha(1f);
+                    pillView.setVisibility(View.VISIBLE);
+                }
             }
             boolean shown = card.getVisibility() == View.VISIBLE;
 
@@ -835,6 +917,8 @@ public class MainHook implements IXposedHookLoadPackage {
             updateBubble();
 
             if (!shown) {
+                // Grows out of the pill if it is showing, otherwise out of the camera circle
+                card.setStartW(pillOn ? w0 : h0);
                 lp.width = w;
                 lp.height = hh;
                 try {
@@ -849,7 +933,6 @@ public class MainHook implements IXposedHookLoadPackage {
             } else {
                 animateTo(1f);
             }
-            if (pillView.getVisibility() != View.GONE) pillView.setVisibility(View.VISIBLE);
             schedule(ms);
         }
 
@@ -857,7 +940,7 @@ public class MainHook implements IXposedHookLoadPackage {
             h.removeCallbacks(collapse);
             if (!expanded) return;
             expanded = false;
-            if (!hidden) pillView.setVisibility(View.VISIBLE);
+            if (pillOn && !hidden) pillView.setVisibility(View.VISIBLE);
             updateBubble();
             animateTo(0f);
         }
@@ -877,7 +960,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 return;
             }
             int m = topMode();
-            open(m, (m == MODE_CALL || m == MODE_RECORD) ? 0 : TAP_SHOW_MS);
+            open(m, m == MODE_CALL ? 0 : TAP_SHOW_MS);
         }
 
         void sendPi(PendingIntent pi) {
@@ -938,6 +1021,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 updateIndicators();
                 startTicker();
                 if (expanded && mode == MODE_CALL) close();
+                syncPill();
                 return;
             }
             int prev = callState;
@@ -963,9 +1047,10 @@ public class MainHook implements IXposedHookLoadPackage {
             } else if (prev == CALL_NONE) {
                 if (canShow()) open(MODE_CALL, 3000);
             }
+            syncPill();
         }
 
-        // ---------------- screen recording
+        // ---------------- screen recording (only the red dot)
 
         boolean recordingNotifActive() {
             try {
@@ -1000,11 +1085,7 @@ public class MainHook implements IXposedHookLoadPackage {
             tickTexts();
             startTicker();
             updateBubble();
-            if (on) {
-                event(MODE_RECORD, RECORD_SHOW_MS);
-            } else if (expanded && mode == MODE_RECORD) {
-                close();
-            }
+            if (!on && expanded && mode == MODE_RECORD) close();
         }
 
         // ---------------- media
@@ -1039,6 +1120,7 @@ public class MainHook implements IXposedHookLoadPackage {
             if (!active) {
                 lastEventTitle = "";
                 if (expanded && mode == MODE_MEDIA) close();
+                syncPill();
                 return;
             }
             boolean changed = !title.isEmpty() && !title.equals(lastEventTitle);
@@ -1046,6 +1128,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 lastEventTitle = title;
                 event(MODE_MEDIA, MEDIA_SHOW_MS);
             }
+            syncPill();
         }
 
         long mediaPosition() {
@@ -1150,6 +1233,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         void tick() {
+            checkRotation();
             // Safety net: if the recording notification is gone, the recording is over
             if (recording && SystemClock.elapsedRealtime() - recSince > 2500
                     && !recordingNotifActive()) {
@@ -1183,14 +1267,15 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ---------------------------------------------------------------- the glass card
 
-    /** Draws the rounded glass shape that grows from the pill to the full card. */
+    /** Draws the rounded glass shape that grows from the pill (or camera) to the full card. */
     private static class Card extends FrameLayout {
         final Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
         final Paint glow = new Paint(Paint.ANTI_ALIAS_FLAG);
         final Paint edge = new Paint(Paint.ANTI_ALIAS_FLAG);
         final RectF rect = new RectF();
         final float d;
-        final int w0, h0;
+        final int h0;
+        int startW;
         float p = 0f;
         int accent = DEFAULT_ACCENT;
         float glowAmount = 0f;
@@ -1198,7 +1283,7 @@ public class MainHook implements IXposedHookLoadPackage {
         Card(Context c, float d, int w0, int h0) {
             super(c);
             this.d = d;
-            this.w0 = w0;
+            this.startW = w0;
             this.h0 = h0;
             setWillNotDraw(false);
             setClipToOutline(true);
@@ -1215,6 +1300,12 @@ public class MainHook implements IXposedHookLoadPackage {
             });
         }
 
+        void setStartW(int w) {
+            startW = w;
+            invalidateOutline();
+            invalidate();
+        }
+
         void calc() {
             float w = getWidth();
             float hh = getHeight();
@@ -1222,9 +1313,9 @@ public class MainHook implements IXposedHookLoadPackage {
                 rect.set(0f, 0f, 0f, 0f);
                 return;
             }
-            float pl = (w - w0) / 2f;
+            float pl = (w - startW) / 2f;
             float left = pl * (1f - p);
-            float right = pl + w0 + (w - (pl + w0)) * p;
+            float right = pl + startW + (w - (pl + startW)) * p;
             float bottom = h0 + (hh - h0) * p;
             rect.set(left, 0f, right, bottom);
         }
@@ -1282,13 +1373,19 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** The round bubble with a red dot shown beside the pill while recording. */
+    /** The round bubble with a red dot shown beside the camera while recording. */
     private static class Bubble {
+        final WindowManager wm;
         final FrameLayout view;
         final WindowManager.LayoutParams lp;
         final RightIndicator dot;
+        final int h0;
+        final int gap;
 
-        Bubble(Context ctx, WindowManager wm, float d, int w0, int h0, int y0) {
+        Bubble(Context ctx, WindowManager wm, float d, int h0, int y0) {
+            this.wm = wm;
+            this.h0 = h0;
+            this.gap = (int) (6 * d);
             view = new FrameLayout(ctx);
             view.setBackground(oval(Color.BLACK));
             dot = new RightIndicator(ctx, d);
@@ -1301,13 +1398,24 @@ public class MainHook implements IXposedHookLoadPackage {
                             | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                     PixelFormat.TRANSLUCENT);
             lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-            lp.x = w0 / 2 + (int) (6 * d) + h0 / 2;
+            lp.x = h0 / 2 + gap + h0 / 2;
             lp.y = y0;
             lp.layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
             lp.setTitle("IslandBubble");
             view.setVisibility(View.GONE);
             wm.addView(view, lp);
+        }
+
+        /** Sits just to the right of the pill, or of the camera when the pill is hidden. */
+        void place(int halfW) {
+            int x = halfW + gap + h0 / 2;
+            if (x == lp.x) return;
+            lp.x = x;
+            try {
+                wm.updateViewLayout(view, lp);
+            } catch (Throwable ignored) {
+            }
         }
 
         void show(boolean s) {
@@ -1694,7 +1802,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Screen recording status, timer and stop button. */
+    /** Screen recording status, timer and stop button (opened from the red dot). */
     private static class RecordContent extends LinearLayout {
         final TextView title, time, stop;
 
@@ -1992,7 +2100,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Right side of the collapsed pill: moving bars or a pulsing dot. */
+    /** Right side of the pill: moving bars. Also the pulsing dot in the recording bubble. */
     private static class RightIndicator extends View {
         static final int NONE = 0, BARS = 1, DOT = 2;
         final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
